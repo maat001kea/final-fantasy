@@ -119,14 +119,18 @@ ANTI_DETECTION_JS = """
         defineValue(fn, "toString", () => `function ${name}() { [native code] }`);
         return fn;
     };
-
-    // --- OS/Browser Alignment (Mac/Apple Profile) ---
+// --- OS/Browser Alignment (Mac/Apple Profile) ---
     const navProto = Object.getPrototypeOf(navigator);
     defineGetter(navProto, "webdriver", () => undefined);
     defineGetter(navProto, "platform", () => "MacIntel");
     defineGetter(navProto, "languages", () => ["da-DK", "da", "en-US", "en"]);
     defineGetter(navProto, "hardwareConcurrency", () => 8);
     defineGetter(navProto, "deviceMemory", () => 8);
+    
+    // --- NYT: User-Agent og Vendor der matcher Mac-profilen ---
+    defineGetter(navProto, "userAgent", () => "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
+    defineGetter(navProto, "vendor", () => "Google Inc.");
+    defineGetter(navProto, "appVersion", () => "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
 
     if (!window.chrome) defineValue(window, "chrome", {});
     ["runtime", "app", "csi", "loadTimes"].forEach(prop => {
