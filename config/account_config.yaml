@@ -1,0 +1,26 @@
+# Account and risk configuration
+currency: GBP
+starting_balance: 1000
+
+# Daily loss limits
+max_daily_loss_abs: 30        # £30 = 3% of £1000
+max_daily_loss_pct: 3.0
+
+# Kill switch
+kill_switch_at_loss_pct: 5.0
+
+# Weekly/monthly limits
+max_weekly_loss_abs: 100
+max_monthly_loss_abs: 250
+
+# Daily profit target (discipline stop)
+daily_profit_target_abs: 50
+
+# Trade limits
+max_trades_per_day: 3
+max_trades_per_hour: 2
+
+# Cooldown after loss (seconds)
+loss_cooldown_seconds: 300        # 5 minutes
+consecutive_loss_cooldown_seconds: 1800  # 30 minutes after 3+ consecutive losses
+consecutive_loss_threshold: 3

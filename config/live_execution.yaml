@@ -1,0 +1,13 @@
+contract_symbol: MYM
+point_value_usd: 0.5
+fee_per_side_usd: 0.52
+default_quantity: 1
+max_positions_per_strategy: 1
+max_daily_loss_r: 3.0
+max_consecutive_losses: 4
+webhook_rate_limit_per_min: 60
+webhook_rate_limit_per_hour: 500
+webhook_timeout_sec: 10.0
+webhook_max_retries: 3
+webhook_backoff_base_sec: 0.5
+webhook_url: ""

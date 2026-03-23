@@ -1,0 +1,25 @@
+# Position sizing configuration
+model: fixed_risk_per_trade
+risk_per_trade_pct: 1.0   # £10 risk per trade on £1000 account
+
+min_quantity: 0.10
+max_quantity: 5.0
+
+# Instrument overrides
+instrument_overrides:
+  DAX:
+    tick_value_gbp: 1.0
+    min_quantity: 0.10
+    max_quantity: 5.0
+  DOW:
+    tick_value_gbp: 1.0
+    min_quantity: 0.10
+    max_quantity: 5.0
+  "S&P 500":
+    tick_value_gbp: 1.0
+    min_quantity: 0.10
+    max_quantity: 5.0
+  FTSE:
+    tick_value_gbp: 1.0
+    min_quantity: 0.10
+    max_quantity: 5.0
