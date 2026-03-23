@@ -369,6 +369,7 @@ class RiskGate:
             self.state.last_loss_time = now
         else:
             self.state.consecutive_losses = 0
+            self.state.last_loss_time = None  # <--- SIKKERHEDSVENTIL: Nulstiller loss timer ved overskud!
 
         # Trigger kill switch if loss exceeds kill_switch_at_loss_pct
         kill_threshold = self.account_balance * (self.config.kill_switch_at_loss_pct / 100.0)

@@ -1874,6 +1874,7 @@ class CDPHumanAdapter(BrokerAdapter):
             # Set stop loss if provided
             if request.stop_price is not None:
                 stop_selectors = self._selectors.order_stop_field.split(", ")
+                stop_filled = False  # <--- SIKKERHEDSVENTIL TILFØJET
                 for selector in stop_selectors:
                     try:
                         await self._human_click_selector(selector)
@@ -1883,9 +1884,16 @@ class CDPHumanAdapter(BrokerAdapter):
                             {"expression": f"document.querySelector('{selector}').value = ''"}
                         )
                         await self._human_type(str(request.stop_price))
+                        stop_filled = True  # <--- SIKKERHEDSVENTIL TILFØJET
                         break
                     except Exception:
                         continue
+
+                # <--- SIKKERHEDSVENTIL START --->
+                if not stop_filled:
+                    _LOGGER.error("[CDPHumanAdapter] FATAL: Kunne ikke indtaste stop-loss!")
+                    raise RuntimeError("KUNNE IKKE INDTASTE STOP-LOSS! Ordre afbrudt for at forhindre ubeskyttet position hos LucidFlex.")
+                # <--- SIKKERHEDSVENTIL SLUT --->
             
             await human_pause(0.3, 0.8)
             
