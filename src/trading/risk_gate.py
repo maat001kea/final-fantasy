@@ -17,6 +17,7 @@ class RiskConfig:
     max_daily_loss_abs: float = 30.0
     max_daily_loss_pct: float = 3.0
     kill_switch_at_loss_pct: float = 5.0
+    max_risk_per_contract_abs: float | None = None
     max_weekly_loss_abs: float = 100.0
     max_monthly_loss_abs: float = 250.0
     daily_profit_target_abs: float = 50.0
@@ -35,6 +36,11 @@ class RiskConfig:
             max_daily_loss_abs=float(d.get("max_daily_loss_abs", 30.0)),
             max_daily_loss_pct=float(d.get("max_daily_loss_pct", 3.0)),
             kill_switch_at_loss_pct=float(d.get("kill_switch_at_loss_pct", 5.0)),
+            max_risk_per_contract_abs=(
+                float(d["max_risk_per_contract_abs"])
+                if d.get("max_risk_per_contract_abs") is not None
+                else None
+            ),
             max_weekly_loss_abs=float(d.get("max_weekly_loss_abs", 100.0)),
             max_monthly_loss_abs=float(d.get("max_monthly_loss_abs", 250.0)),
             daily_profit_target_abs=float(d.get("daily_profit_target_abs", 50.0)),
@@ -315,7 +321,20 @@ class RiskGate:
         checks_passed.append("cooldown")
 
         # 12. Position size check
-        kill_threshold = self.account_balance * (self.config.kill_switch_at_loss_pct / 100.0)
+        risk_per_contract = risk_pts * tick_value
+        configured_contract_cap = self.config.max_risk_per_contract_abs
+        if configured_contract_cap is not None and configured_contract_cap > 0:
+            kill_threshold = float(quantity) * float(configured_contract_cap)
+            if risk_per_contract > configured_contract_cap:
+                return _reject(
+                    (
+                        f"Risk per contract {risk_per_contract:.2f} exceeds "
+                        f"configured cap {configured_contract_cap:.2f}"
+                    ),
+                    "risk_per_contract",
+                )
+        else:
+            kill_threshold = self.account_balance * (self.config.kill_switch_at_loss_pct / 100.0)
         if risk_amount > kill_threshold:
             return _reject(
                 f"Position size risk {risk_amount:.2f} exceeds kill-switch threshold {kill_threshold:.2f}",

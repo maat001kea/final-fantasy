@@ -1,6 +1,6 @@
 # Position sizing configuration
 model: fixed_risk_per_trade
-risk_per_trade_pct: 1.0   # £10 risk per trade on £1000 account
+risk_per_trade_pct: 25.0   # £10 risk per trade on £1000 account
 
 min_quantity: 0.10
 max_quantity: 5.0
@@ -12,7 +12,7 @@ instrument_overrides:
     min_quantity: 0.10
     max_quantity: 5.0
   DOW:
-    tick_value_gbp: 1.0
+    tick_value_gbp: 0.5    # Vigtigt: MYM (Micro Dow) har en tick-værdi på $0.50, ikke $1.0
     min_quantity: 0.10
     max_quantity: 5.0
   "S&P 500":
@@ -23,3 +23,5 @@ instrument_overrides:
     tick_value_gbp: 1.0
     min_quantity: 0.10
     max_quantity: 5.0
+
+

@@ -12,7 +12,7 @@ import random
 import tempfile
 import time as time_module
 import threading
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, MutableMapping
 from zoneinfo import ZoneInfo
@@ -531,6 +531,12 @@ CUSTOM_HUMAN_BROKER_CONFIRMATION_TIMEOUT_SECONDS = 10.0
 
 
 CUSTOM_HUMAN_EXIT_CONFIRMATION_TIMEOUT_SECONDS = 5.0
+
+
+CUSTOM_HUMAN_STARTUP_INFLIGHT_MAX_AGE_SECONDS = 60.0 * 60.0
+
+
+CUSTOM_HUMAN_STARTUP_ACTIVITY_SAFETY_WINDOW_SECONDS = 120.0
 
 
 CUSTOM_HUMAN_LIVE_RANGE_KEY = "5d"
@@ -1830,6 +1836,189 @@ def _custom_human_has_nonterminal_inflight(shared: dict[str, Any] | None) -> boo
     return False
 
 
+def _parse_custom_human_iso_timestamp(value: Any) -> datetime | None:
+    token = str(value or "").strip()
+    if not token:
+        return None
+    try:
+        parsed = datetime.fromisoformat(token)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=APP_TIMEZONE)
+    return parsed.astimezone(APP_TIMEZONE)
+
+
+def _custom_human_inflight_entry_latest_ts(entry: dict[str, Any] | None) -> datetime | None:
+    if not isinstance(entry, dict):
+        return None
+    candidates = (
+        _parse_custom_human_iso_timestamp(entry.get("confirmed_at")),
+        _parse_custom_human_iso_timestamp(entry.get("clicked_at")),
+        _parse_custom_human_iso_timestamp(entry.get("queued_at")),
+        _parse_custom_human_iso_timestamp(entry.get("reserved_at")),
+    )
+    valid = [item for item in candidates if item is not None]
+    return max(valid) if valid else None
+
+
+def _prune_stale_custom_human_inflight_orders(
+    shared: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    max_age_seconds: float = CUSTOM_HUMAN_STARTUP_INFLIGHT_MAX_AGE_SECONDS,
+) -> tuple[dict[str, Any], int]:
+    inflight_orders = _coerce_custom_human_inflight_orders(shared.get("inflight_orders"))
+    if not inflight_orders:
+        return {}, 0
+    observed_now = now or datetime.now(tz=APP_TIMEZONE)
+    cutoff = observed_now - timedelta(seconds=max(0.0, float(max_age_seconds)))
+    live_state = _coerce_custom_human_live_state(shared.get("live_state"))
+    keep_pending_signal_id = str(live_state.get("pending_signal_id", "") or "").strip()
+    keep_position_open = bool(live_state.get("position_open", False))
+    keep_position_key = _custom_human_router_position_key(shared) if keep_position_open else ""
+    kept: dict[str, Any] = {}
+    removed = 0
+    for signal_id, raw_entry in inflight_orders.items():
+        entry = dict(raw_entry) if isinstance(raw_entry, dict) else {}
+        token = str(entry.get("signal_id", signal_id) or signal_id).strip()
+        if token == keep_pending_signal_id:
+            kept[token] = entry
+            continue
+        if keep_position_open and keep_position_key and str(entry.get("position_key", "") or "").strip() == keep_position_key:
+            kept[token] = entry
+            continue
+        latest_ts = _custom_human_inflight_entry_latest_ts(entry)
+        if latest_ts is None or latest_ts >= cutoff:
+            kept[token] = entry
+            continue
+        removed += 1
+    shared["inflight_orders"] = kept
+    return kept, removed
+
+
+def _custom_human_has_recent_startup_activity(
+    shared: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    not_before: datetime | None = None,
+    safety_window_seconds: float = CUSTOM_HUMAN_STARTUP_ACTIVITY_SAFETY_WINDOW_SECONDS,
+) -> bool:
+    observed_now = now or datetime.now(tz=APP_TIMEZONE)
+    cutoff = observed_now - timedelta(seconds=max(0.0, float(safety_window_seconds)))
+    activity_cutoff = max(
+        cutoff,
+        not_before.astimezone(APP_TIMEZONE) if isinstance(not_before, datetime) else cutoff,
+    )
+    live_state = _coerce_custom_human_live_state(shared.get("live_state"))
+    direct_candidates = [
+        shared.get("last_worker_interaction_at"),
+        (shared.get("live_last_confirmation") or {}).get("confirmed_at")
+        if isinstance(shared.get("live_last_confirmation"), dict)
+        else None,
+    ]
+    for candidate in direct_candidates:
+        parsed = _parse_custom_human_iso_timestamp(candidate)
+        if parsed is not None and parsed >= activity_cutoff:
+            return True
+    inflight_orders = _coerce_custom_human_inflight_orders(shared.get("inflight_orders"))
+    for entry in inflight_orders.values():
+        latest_ts = _custom_human_inflight_entry_latest_ts(entry)
+        if latest_ts is not None and latest_ts >= activity_cutoff:
+            return True
+    return False
+
+
+def _cleanup_stale_runtime_on_startup(
+    shared: dict[str, Any],
+    *,
+    snapshot_raw: dict[str, Any] | None = None,
+    reset_context: str = "startup flat snapshot",
+) -> dict[str, Any]:
+    if not isinstance(shared, dict):
+        return {"ok": False, "status": "invalid_shared", "message": "Shared state mangler."}
+
+    snapshot = _coerce_custom_human_tradovate_snapshot_startup(
+        snapshot_raw if isinstance(snapshot_raw, dict) else shared.get("tradovate_snapshot")
+    )
+    if not isinstance(snapshot, dict):
+        return {"ok": False, "status": "no_snapshot", "message": "Ingen brugbar Tradovate snapshot til cleanup."}
+
+    snapshot_flat = (
+        bool(snapshot.get("connected", False))
+        and bool(snapshot.get("account_ok", False))
+        and bool(snapshot.get("instrument_visible", False))
+        and not bool(snapshot.get("position_open", False))
+        and abs(_safe_float_startup(snapshot.get("position_qty")) or 0.0) <= 0.0
+    )
+    if not snapshot_flat:
+        return {"ok": False, "status": "broker_not_flat", "message": "Broker snapshot er ikke stabilt flat."}
+
+    now = datetime.now(tz=APP_TIMEZONE)
+    startup_reference = _parse_custom_human_iso_timestamp(shared.get("engine_started_at"))
+    _, pruned_count = _prune_stale_custom_human_inflight_orders(shared, now=now)
+    live_state = _coerce_custom_human_live_state(shared.get("live_state"))
+    phase = str(live_state.get("phase", "") or "").strip().lower()
+    if bool(live_state.get("reconcile_required", False)) or phase == "manual_reconcile":
+        return {
+            "ok": False,
+            "status": "manual_reconcile",
+            "message": "Startup-cleanup sprang over: manual_reconcile kræver særskilt afklaring.",
+            "pruned_inflight_orders": pruned_count,
+        }
+    if _custom_human_has_recent_startup_activity(shared, now=now, not_before=startup_reference):
+        return {
+            "ok": False,
+            "status": "recent_activity",
+            "message": "Startup-cleanup sprang over: frisk signal-/klikaktivitet fundet efter denne startup.",
+            "pruned_inflight_orders": pruned_count,
+        }
+    if _custom_human_has_nonterminal_inflight(shared):
+        return {
+            "ok": False,
+            "status": "nonterminal_inflight",
+            "message": "Startup-cleanup sprang over: nonterminal inflight-ordrer findes stadig.",
+            "pruned_inflight_orders": pruned_count,
+        }
+
+    removed_inflight = len(_coerce_custom_human_inflight_orders(shared.get("inflight_orders")))
+    trade_date = str(live_state.get("trade_date", "") or now.strftime("%Y-%m-%d"))
+    reset_state = _default_custom_human_live_state(trade_date=trade_date)
+    reset_state["phase"] = "waiting_for_setup"
+    reset_state["broker_position_qty"] = 0.0
+    reset_state["broker_account_value"] = str(snapshot.get("account_value", "") or "")
+    reset_state["last_broker_snapshot"] = dict(snapshot)
+    reset_state["last_reconciled_at"] = str(snapshot.get("observed_at", "") or now.isoformat())
+    reset_state["last_note"] = "Startup-cleanup: broker er flat, stale state ryddet."
+
+    shared["live_state"] = reset_state
+    shared["live_observer_status"] = "Klar – venter på signal..."
+    shared["inflight_orders"] = {}
+    shared["live_last_dispatch"] = None
+    shared["live_last_confirmation"] = None
+    shared["execution_confirmations"] = {}
+    shared["last_result"] = "Klar – venter på signal..."
+    _release_custom_human_router_cycle_for_flat_position(
+        shared,
+        reset_context=reset_context,
+    )
+    try:
+        _clear_custom_human_riskgate_cache(shared)
+    except Exception as exc:  # pragma: no cover
+        _APP_LOGGER.warning("Startup-cleanup: kunne ikke rydde RiskGate-cache (non-critical): %s", exc)
+
+    return {
+        "ok": True,
+        "status": "clean_slate_applied",
+        "message": (
+            f"Startup-cleanup anvendt: broker flat, {removed_inflight} inflight-ordrer ryddet"
+            + (f", {pruned_count} stale pre-pruned." if pruned_count else ".")
+        ),
+        "cleared_inflight_orders": removed_inflight,
+        "pruned_inflight_orders": pruned_count,
+    }
+
+
 def _consume_custom_human_terminal_inflight_confirmation(
     shared: dict[str, Any],
     signal_id: str,
@@ -2236,14 +2425,32 @@ def _clear_stale_custom_human_reconcile_from_snapshot(
     return True
 
 
-def _sanitize_custom_human_runtime_after_stop(shared: dict[str, Any], *, reason: str) -> bool:
+def _sanitize_custom_human_runtime_after_stop(
+    shared: dict[str, Any],
+    *,
+    reason: str,
+    force_clear_flat_snapshot_state: bool = False,
+) -> bool:
     live_state = _coerce_custom_human_live_state(shared.get("live_state"))
     snapshot = _coerce_custom_human_tradovate_snapshot_startup(shared.get("tradovate_snapshot"))
     snapshot_position_open = bool(snapshot.get("position_open", False)) if isinstance(snapshot, dict) else False
     snapshot_position_qty = abs(_safe_float_startup((snapshot or {}).get("position_qty")) or 0.0)
     has_nonterminal_inflight = _custom_human_has_nonterminal_inflight(shared)
-    if snapshot_position_open or snapshot_position_qty > 0.0 or has_nonterminal_inflight:
+    snapshot_confirms_flat = isinstance(snapshot, dict) and not snapshot_position_open and snapshot_position_qty <= 0.0
+    if snapshot_position_open or snapshot_position_qty > 0.0:
         return False
+    if has_nonterminal_inflight and not (force_clear_flat_snapshot_state and snapshot_confirms_flat):
+        return False
+
+    if force_clear_flat_snapshot_state and snapshot_confirms_flat:
+        _release_custom_human_router_cycle_for_flat_position(
+            shared,
+            reset_context="user stop / flat snapshot",
+        )
+        try:
+            _clear_custom_human_riskgate_cache(shared)
+        except Exception as exc:  # pragma: no cover
+            _APP_LOGGER.warning("Kunne ikke rydde RiskGate-cache under stop (non-critical): %s", exc)
 
     trade_date = str(live_state.get("trade_date", "") or "")
     reset_state = _default_custom_human_live_state(trade_date=trade_date)
@@ -3555,6 +3762,7 @@ def _build_cdp_auto_trade_shared_state() -> dict[str, Any]:
         "diagnostics_events": [],
         "diagnostic_markers": {},
         "last_worker_interaction_at": None,
+        "engine_started_at": None,
         "idle_health_check_next_at": None,
         "last_auto_recovered_at": None,
         "bio_polling_enabled": False,
@@ -3619,6 +3827,7 @@ def _get_cdp_auto_trade_shared_singleton() -> dict[str, Any]:
     shared.setdefault("diagnostics_events", [])
     shared.setdefault("diagnostic_markers", {})
     shared.setdefault("last_worker_interaction_at", None)
+    shared.setdefault("engine_started_at", None)
     shared.setdefault("idle_health_check_next_at", None)
     shared.setdefault("last_auto_recovered_at", None)
     shared.setdefault("bio_polling_enabled", False)
@@ -3821,7 +4030,11 @@ def _stop_custom_human_auto_runtime(
     shared["live_feed_cache"] = None
     shared["live_feed_cache_fetched_at"] = ""
     shared["bio_polling_enabled"] = False
-    _sanitize_custom_human_runtime_after_stop(shared, reason=reason)
+    _sanitize_custom_human_runtime_after_stop(
+        shared,
+        reason=reason,
+        force_clear_flat_snapshot_state=user_initiated,
+    )
     _persist_custom_human_runtime_state(shared)
 
 
@@ -4204,6 +4417,51 @@ def _verify_cdp_signal_broker_state(
         ),
         "position_snapshot": last_snapshot,
     }
+
+
+def _attempt_custom_human_emergency_flat_recovery(
+    adapter: "CDPHumanAdapter",
+    signal_payload: dict[str, Any],
+    stop_event: threading.Event,
+    *,
+    shared: dict[str, Any],
+    before_snapshot: dict[str, Any] | None,
+    expected_account_tokens: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    payload = dict(signal_payload) if isinstance(signal_payload, dict) else {}
+    signal = str(payload.get("signal", "")).strip().upper()
+    action = str(payload.get("action", "")).strip().lower()
+    if signal != "FLAT" and action != "exit":
+        return None
+    try:
+        _run_cdp_adapter_task(adapter, adapter.close_all_positions)
+    except Exception as exc:
+        return {
+            "confirmed": False,
+            "status": "emergency_flat_failed",
+            "message": f"Emergency FLAT fallback fejlede: {exc}",
+            "position_snapshot": None,
+        }
+    verification = _verify_cdp_signal_broker_state(
+        adapter,
+        payload,
+        stop_event,
+        shared=shared,
+        before_snapshot=before_snapshot,
+        expected_account_tokens=expected_account_tokens,
+        timeout_s=max(
+            float(CUSTOM_HUMAN_BROKER_CONFIRMATION_TIMEOUT_SECONDS),
+            float(CUSTOM_HUMAN_EXIT_CONFIRMATION_TIMEOUT_SECONDS),
+        ),
+    )
+    if bool(verification.get("confirmed", False)):
+        verification = dict(verification)
+        verification["status"] = "confirmed_flat_recovered"
+        verification["message"] = (
+            str(verification.get("message", "")).strip()
+            or "Emergency FLAT fallback bekræftede broker-flat."
+        )
+    return verification
 
 
 def _custom_human_tradovate_snapshot_price(snapshot_raw: dict[str, Any] | None) -> float | None:
@@ -4771,6 +5029,35 @@ def _cdp_auto_trade_loop(
                             verification_message = str(verification.get("message", "")).strip()
                             verification_status = str(verification.get("status", "")).strip() or "verified"
                             confirmed = bool(verification.get("confirmed", False))
+                            if signal == "FLAT" and not confirmed:
+                                recovery_verification = _attempt_custom_human_emergency_flat_recovery(
+                                    adapter,
+                                    signal_payload or {},
+                                    stop_event,
+                                    shared=shared,
+                                    before_snapshot=before_snapshot,
+                                    expected_account_tokens=tuple(shared.get("expected_account_tokens") or ()),
+                                )
+                                if isinstance(recovery_verification, dict):
+                                    recovery_confirmed = bool(recovery_verification.get("confirmed", False))
+                                    if recovery_confirmed:
+                                        verification = recovery_verification
+                                        verification_message = str(verification.get("message", "")).strip()
+                                        verification_status = (
+                                            str(verification.get("status", "")).strip()
+                                            or "confirmed_flat_recovered"
+                                        )
+                                        confirmed = True
+                                        _APP_LOGGER.warning(
+                                            "[GHOST-V6.6] FLAT recovery succeeded via emergency close_all_positions fallback."
+                                        )
+                                    elif not verification_message:
+                                        verification = recovery_verification
+                                        verification_message = str(verification.get("message", "")).strip()
+                                        verification_status = (
+                                            str(verification.get("status", "")).strip()
+                                            or verification_status
+                                        )
                             if confirmed:
                                 shared["last_result"] = (
                                     f"✅ {signal_label} klik udført via {location_label} – broker-state bekræftet"
@@ -4818,7 +5105,14 @@ def _cdp_auto_trade_loop(
                                     cooldown_timeout,
                                 )
                             else:
-                                stop_event.wait(timeout=cooldown_timeout)
+                                # Yield the post-click cooldown early if a fresh signal
+                                # arrives. This is especially important for queued FLAT
+                                # commands right after an entry fill.
+                                _wait_for_custom_human_post_flat_cooldown(
+                                    stop_event,
+                                    signal_queue,
+                                    cooldown_timeout,
+                                )
                         else:
                             message = f"{signal_label}: element `{selector}` ikke fundet i DOM"
                             shared["last_result"] = f"❌ {message}"

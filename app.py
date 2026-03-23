@@ -878,6 +878,26 @@ def _engine_status() -> dict[str, Any]:
     return fetch_status(_bridge_path())
 
 
+def _normalize_engine_status_for_ui(
+    service_status: dict[str, Any],
+    engine_status: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(engine_status) if isinstance(engine_status, dict) else {}
+    status_age = _bridge_status_age_seconds(normalized)
+    bridge_fresh = status_age is not None and status_age <= 5.0
+    if bool(service_status.get("running", False)) and bridge_fresh:
+        return normalized
+
+    # Bridge payload is persisted across restarts, so when the supervisor is
+    # stopped, or when the heartbeat is stale, the last known auto/connection
+    # flags can remain stale in the UI.
+    normalized["connected"] = False
+    normalized["auto_requested"] = False
+    normalized["running"] = False
+    normalized["runtime_active"] = False
+    return normalized
+
+
 def _account_config() -> dict[str, Any]:
     return _load_yaml(str(ACCOUNT_CONFIG_PATH))
 
@@ -906,7 +926,7 @@ def _runtime_profile() -> dict[str, Any]:
         "account_size_usd": float(starting_balance or 0.0),
         "risk_profile": "Aggressive",
         "lock_profile_risk": False,
-        "risk_usd": 0.0,
+        "risk_usd": 360.0,
         "sizing_mode": "Fixed contracts",
         "fixed_contracts": fixed_contracts,
         "configured_fixed_contracts": fixed_contracts,
@@ -1933,7 +1953,7 @@ def main() -> None:
 
     service_status = _service_status()
     chrome_status = _chrome_status()
-    engine_status = _engine_status()
+    engine_status = _normalize_engine_status_for_ui(service_status, _engine_status())
 
     _render_system_banner(service_status, chrome_status, engine_status)
 

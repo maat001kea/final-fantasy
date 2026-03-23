@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import random
@@ -8,7 +9,7 @@ import shutil
 import socket
 import subprocess
 import time as time_module
-from datetime import date, time
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -859,6 +860,53 @@ def _handle_set_position_metadata(shared: dict[str, Any], payload: dict[str, Any
     return _command_result(msg, ok=True, status="metadata_set")
 
 
+def _build_manual_signal_payload(shared: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    signal = str(payload.get("signal", "") or "").strip().upper()
+    if signal not in {"BUY", "SELL"}:
+        raise ValueError(f"Unsupported manual signal '{signal}'.")
+
+    runtime_profile = dict(shared.get("runtime_profile")) if isinstance(shared.get("runtime_profile"), dict) else {}
+    tradovate_snapshot = (
+        dict(shared.get("tradovate_snapshot")) if isinstance(shared.get("tradovate_snapshot"), dict) else {}
+    )
+
+    action = "buy" if signal == "BUY" else "sell"
+    instrument = (
+        str(payload.get("instrument", "") or "").strip().upper()
+        or str(runtime_profile.get("ticker") or runtime_profile.get("contract_symbol") or "").strip().upper()
+        or str(tradovate_snapshot.get("instrument_root", "") or "").strip().upper()
+        or "MYM"
+    )
+
+    quantity = payload.get("quantity")
+    if quantity is None:
+        quantity = (
+            engine_core._safe_float(tradovate_snapshot.get("order_quantity_value"))
+            or engine_core._safe_float(runtime_profile.get("fixed_contracts"))
+            or 1.0
+        )
+    quantity = max(1, int(round(float(quantity))))
+
+    trade_date = str((shared.get("live_state") or {}).get("trade_date", "") or date.today().isoformat()).strip()
+    signal_id = hashlib.sha256(
+        f"manual_ui:{signal}:{instrument}:{quantity}:{time_module.time_ns()}".encode("utf-8")
+    ).hexdigest()[:24]
+
+    manual_payload = dict(payload)
+    manual_payload.update(
+        {
+            "signal": signal,
+            "action": action,
+            "event": str(payload.get("event", "") or "manual_ui").strip().lower(),
+            "signal_id": str(payload.get("signal_id", "") or signal_id).strip(),
+            "instrument": instrument,
+            "quantity": quantity,
+            "trade_date": trade_date,
+        }
+    )
+    return manual_payload
+
+
 def _handle_clear_riskgate_cache(shared: dict[str, Any]) -> dict[str, Any]:
     """Bridge handler for CLEAR_RISKGATE_CACHE command.
 
@@ -968,6 +1016,11 @@ def _process_command(shared: dict[str, Any], command: dict[str, Any]) -> dict[st
         )
         shared["adapter"] = adapter
         shared["connected"] = bool(adapter.is_connected)
+        _run_startup_cleanup_if_safe(
+            shared,
+            adapter,
+            reset_context="connect command / flat snapshot",
+        )
         shared["last_result"] = message
         shared["debug_port"] = requested_port
         _clear_engine_fault(shared)
@@ -1005,10 +1058,13 @@ def _process_command(shared: dict[str, Any], command: dict[str, Any]) -> dict[st
         shared["last_result"] = str(queue_message)
         return _command_result(queue_message, ok=queue_status == "queued_to_cdp", status=queue_status)
     if action == "MANUAL_SIGNAL":
-        signal = str(payload.get("signal", "") or "").strip().upper()
-        queue_status, queue_message = engine_core._queue_cdp_signal_from_custom_human(
-            {"signal": signal, "event": "manual_ui"}
-        )
+        try:
+            signal_payload = _build_manual_signal_payload(shared, payload)
+        except Exception as exc:
+            message = f"Manual signal payload ugyldig: {exc}"
+            shared["last_result"] = message
+            return _command_result(message, ok=False, status="invalid_manual_signal")
+        queue_status, queue_message = engine_core._queue_cdp_signal_from_custom_human(signal_payload)
         shared["last_result"] = str(queue_message)
         return _command_result(queue_message, ok=queue_status == "queued_to_cdp", status=queue_status)
     if action == "SET_POSITION_METADATA":
@@ -1119,6 +1175,11 @@ def _try_auto_connect_on_startup(shared: dict[str, Any]) -> None:
         )
         if shared["connected"]:
             LOGGER.info("[GHOST-V6.6] One-click startup: Auto-connected to Chrome on port %s.", port)
+            _run_startup_cleanup_if_safe(
+                shared,
+                shared["adapter"],
+                reset_context="startup auto-connect / flat snapshot",
+            )
             # If the persisted state had auto_requested=True, attempt to re-arm
             # the trading workers immediately (no UI click required).
             if bool(shared.get("auto_requested", False)):
@@ -1157,6 +1218,38 @@ def _try_auto_connect_on_startup(shared: dict[str, Any]) -> None:
             "[GHOST-V6.6] One-click startup: Auto-connect attempt failed (%s) – will wait for UI command.",
             exc,
         )
+
+
+def _run_startup_cleanup_if_safe(
+    shared: dict[str, Any],
+    adapter: engine_core.CDPHumanAdapter,
+    *,
+    reset_context: str,
+) -> dict[str, Any] | None:
+    try:
+        snapshot = engine_core._refresh_custom_human_tradovate_snapshot_health(
+            adapter,
+            shared,
+            observer_cfg=shared.get("tradovate_snapshot_cfg"),
+        )
+    except Exception as exc:
+        LOGGER.debug("[STARTUP] Startup-cleanup snapshot refresh sprang over: %s", exc)
+        return None
+    result = engine_core._cleanup_stale_runtime_on_startup(
+        shared,
+        snapshot_raw=snapshot if isinstance(snapshot, dict) else None,
+        reset_context=reset_context,
+    )
+    if bool(result.get("ok", False)):
+        LOGGER.info("[STARTUP] %s", str(result.get("message", "") or "").strip())
+        engine_core._persist_custom_human_runtime_state(shared)
+    else:
+        LOGGER.info(
+            "[STARTUP] Cleanup sprang over (%s): %s",
+            str(result.get("status", "skipped") or "skipped"),
+            str(result.get("message", "") or "").strip(),
+        )
+    return result
 
 
 def _backup_databases_if_needed(bridge_path: Path) -> None:
@@ -1280,6 +1373,7 @@ def run_engine(*, bridge_db_path: str | Path | None = None) -> None:
     # Safety net: create a daily backup of the databases before the engine touches them
     _backup_databases_if_needed(bridge_path)
     shared = engine_core._cdp_auto_trade_shared
+    shared["engine_started_at"] = datetime.now(engine_core.APP_TIMEZONE).isoformat()
     shared.setdefault("engine_status_override", "")
     shared.setdefault("halted", False)
     shared.setdefault("halt_reason", "")
@@ -1299,6 +1393,11 @@ def run_engine(*, bridge_db_path: str | Path | None = None) -> None:
     except Exception as _restore_exc:
         LOGGER.debug("[GHOST-V6.6] Startup: Could not restore auto_requested: %s", _restore_exc)
 
+    # Publish a bootstrap heartbeat before any auto-connect/auto-rearm work.
+    # Startup recovery can legitimately spend multiple seconds in CDP/browser
+    # calls, and the supervisor must not misread that as a dead child process.
+    _publish_engine_status(bridge_path, shared)
+
     # One-click startup: hook into Chrome automatically if the Watchdog already
     # has it running, so the operator does not need to click 'Connect' in the UI.
     _try_auto_connect_on_startup(shared)
@@ -1308,6 +1407,16 @@ def run_engine(*, bridge_db_path: str | Path | None = None) -> None:
     try:
         while True:
             for command in claim_commands(bridge_path):
+                # Renew the supervisor heartbeat before potentially long-running
+                # command handling so a valid browser action is never mistaken
+                # for a dead engine.
+                claimed_action = str(command.get("command", "") or "").strip().upper()
+                if claimed_action:
+                    shared["last_command"] = claimed_action
+                claimed_id = int(command.get("id", 0) or 0)
+                if claimed_id:
+                    shared["last_command_id"] = claimed_id
+                _publish_engine_status(bridge_path, shared)
                 try:
                     result = _process_command(shared, command)
                 except Exception as exc:  # noqa: BLE001
@@ -1328,6 +1437,8 @@ def run_engine(*, bridge_db_path: str | Path | None = None) -> None:
                 )
                 next_heartbeat_at = time_module.monotonic() + ENGINE_HEARTBEAT_SECONDS
             if time_module.monotonic() >= next_heartbeat_at:
+                # Renew the heartbeat before any self-heal/browser work.
+                _publish_engine_status(bridge_path, shared)
                 recovery = _maybe_self_heal_auto_runtime(shared)
                 if isinstance(recovery, dict) and bool(recovery.get("ok", False)):
                     LOGGER.info(

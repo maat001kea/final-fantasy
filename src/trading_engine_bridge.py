@@ -120,6 +120,27 @@ def publish_status(db_path: str | Path, payload: dict[str, Any]) -> None:
         conn.commit()
 
 
+def publish_neutral_status(
+    db_path: str | Path,
+    *,
+    last_stop_reason: str = "",
+) -> None:
+    publish_status(
+        db_path,
+        {
+            "active": False,
+            "connected": False,
+            "running": False,
+            "runtime_active": False,
+            "auto_requested": False,
+            "halted": True,
+            "last_stop_reason": str(last_stop_reason or ""),
+            "live_observer_status": str(last_stop_reason or "Stoppet."),
+            "tradovate_snapshot_status": str(last_stop_reason or "Stoppet."),
+        },
+    )
+
+
 def fetch_status(db_path: str | Path) -> dict[str, Any]:
     path = init_bridge(db_path)
     with _open_db(path) as conn:

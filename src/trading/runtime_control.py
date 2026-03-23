@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from src.trading.cdp_adapter import CDP_PORT, resolve_cdp_port
-from src.trading_engine_bridge import fetch_status, init_bridge
+from src.trading_engine_bridge import fetch_status, init_bridge, publish_neutral_status
 
 
-ENGINE_SERVICE_HEARTBEAT_TIMEOUT_SECONDS = 8.0
+ENGINE_SERVICE_HEARTBEAT_TIMEOUT_SECONDS = 15.0
 ENGINE_SERVICE_START_TIMEOUT_SECONDS = 6.0
 CHROME_READY_TIMEOUT_SECONDS = 15.0
 CHROME_REUSE_HEARTBEAT_SECONDS = 5.0
@@ -88,6 +88,18 @@ def process_is_alive(pid: int | None) -> bool:
         os.kill(pid, 0)
     except OSError:
         return False
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        stat = str(result.stdout or "").strip().upper()
+        if stat.startswith("Z"):
+            return False
+    except OSError:
+        pass
     return True
 
 
@@ -270,6 +282,8 @@ def read_engine_service_status(
         and heartbeat_age is not None
         and heartbeat_age <= CHROME_REUSE_HEARTBEAT_SECONDS
         and bridge_engine_alive
+        and not bool(bridge_payload.get("halted", False))
+        and bool(bridge_payload.get("active", False) or bridge_payload.get("running", False))
     )
     state = str(payload.get("state", "") or "").strip().lower()
     if supervisor_alive:
@@ -397,6 +411,7 @@ def stop_engine_service(
             }
         )
         _write_json(paths["status_file"], payload)
+        publish_neutral_status(bridge_path, last_stop_reason="Engine service stoppet.")
     latest_status = read_engine_service_status(root, bridge_db_path=bridge_db_path)
     return {
         "ok": bool(stopped_supervisor and stopped_engine),

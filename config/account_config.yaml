@@ -8,6 +8,7 @@ max_daily_loss_pct: 3.0
 
 # Kill switch
 kill_switch_at_loss_pct: 5.0
+max_risk_per_contract_abs: 250.0
 
 # Weekly/monthly limits
 max_weekly_loss_abs: 100
